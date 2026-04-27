@@ -1,4 +1,5 @@
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 from timm.models.layers import Mlp
@@ -7,6 +8,7 @@ from timm.layers import DropPath
 from diffusion_planner.model.diffusion_utils.sampling import dpm_sampler
 from diffusion_planner.model.diffusion_utils.sde import SDE, VPSDE_linear
 from diffusion_planner.utils.normalizer import ObservationNormalizer, StateNormalizer
+from diffusion_planner.utils.token_trajectory_decoder import TokenTrajectoryDecoder
 from diffusion_planner.model.module.mixer import MixerBlock
 from diffusion_planner.model.module.dit import TimestepEmbedder, DiTBlock, FinalLayer
 
@@ -19,23 +21,80 @@ class Decoder(nn.Module):
         self._predicted_neighbor_num = config.predicted_neighbor_num
         self._future_len = config.future_len
         self._sde = VPSDE_linear()
+        self._k_tokens = 16          # 16 motion tokens per trajectory (8s @ 0.5s/token)
+        self._token_emb_dim = config.token_emb_dim
+
+        # neighbor 专用词表路径（若未配置则退回 ego 词表，向后兼容）
+        nbr_vocab_path = getattr(config, 'nbr_vocab_path', None) or config.vocab_path
+
+        # ── Ego token embedding table ────────────────────────────────────────
+        # ego 专用词表，固定不训练
+        ego_vocab_size, self.ego_token_emb = self._build_token_emb(
+            config.vocab_path, config.token_emb_dim, seed=42)
+        self._ego_vocab_size = ego_vocab_size
+
+        # ── Neighbor token embedding table ──────────────────────────────────
+        # neighbor 专用词表（可与 ego 不同大小）
+        nbr_vocab_size, self.nbr_token_emb = self._build_token_emb(
+            nbr_vocab_path, config.token_emb_dim, seed=43)
+        self._nbr_vocab_size = nbr_vocab_size
+
+        # ── Trajectory decoders for inference ───────────────────────────────
+        self.ego_traj_decoder = TokenTrajectoryDecoder(config.vocab_path)
+        self.nbr_traj_decoder = TokenTrajectoryDecoder(nbr_vocab_path)
 
         self.dit = DiT(
-            sde=self._sde, 
+            sde=self._sde,
             route_encoder = RouteEncoder(config.route_num, config.lane_len, drop_path_rate=config.encoder_drop_path_rate, hidden_dim=config.hidden_dim),
-            depth=config.decoder_depth, 
-            output_dim= (config.future_len + 1) * 4, # x, y, cos, sin
-            hidden_dim=config.hidden_dim, 
-            heads=config.num_heads, 
+            depth=config.decoder_depth,
+            output_dim=self._k_tokens * config.token_emb_dim,  # 16 * D
+            hidden_dim=config.hidden_dim,
+            heads=config.num_heads,
             dropout=dpr,
             model_type=config.diffusion_model_type
         )
-        
+
         self._state_normalizer: StateNormalizer = config.state_normalizer
         self._observation_normalizer: ObservationNormalizer = config.observation_normalizer
-        
+
         self._guidance_fn = config.guidance_fn
-        
+        self._guidance_scale = 2.0
+
+    @staticmethod
+    def _build_token_emb(vocab_path: str, token_emb_dim: int, seed: int = 42):
+        """
+        从 vocab_path 加载词表，构建可训练 embedding 表（VQ-VAE 风格）。
+
+        初始化用 centroid 随机投影提供物理先验；训练时通过 commitment loss
+        让 embedding 自适应到 DiT 容易预测的位置。
+
+        Returns
+        -------
+        vocab_size : int
+        token_emb  : nn.Embedding  (vocab_size + 3, token_emb_dim)，requires_grad=True
+        """
+        _data = np.load(vocab_path, allow_pickle=True)
+        _centroids = torch.tensor(_data['centroids'], dtype=torch.float32)
+        vocab_size = _centroids.shape[0]
+        _seg_dim   = _centroids.shape[1]
+
+        torch.manual_seed(seed)
+        _proj      = torch.randn(_seg_dim, token_emb_dim) / (_seg_dim ** 0.5)
+        _motion_emb = _centroids @ _proj                                     # (V, D)
+        _motion_emb = (_motion_emb - _motion_emb.mean()) / (_motion_emb.std() + 1e-6)
+
+        emb = nn.Embedding(vocab_size + 3, token_emb_dim)
+        with torch.no_grad():
+            nn.init.normal_(emb.weight, mean=0.0, std=1.0)
+            emb.weight[3:] = _motion_emb
+
+        # 可训练（与原版相反）。训练循环负责用 stop-gradient + commitment loss
+        # 防止 embedding 与 DiT 互相塌缩。
+        for p in emb.parameters():
+            p.requires_grad = True
+
+        return vocab_size, emb
+
     @property
     def sde(self):
         return self._sde
@@ -88,59 +147,85 @@ class Decoder(nn.Module):
         route_lanes = inputs['route_lanes']
 
         if self.training:
-            sampled_trajectories = inputs['sampled_trajectories'].reshape(B, P, -1) # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
+            # sampled_trajectories: (B, P, 16*D) — noisy token embeddings
+            sampled_trajectories = inputs['sampled_trajectories'].reshape(B, P, -1)
             diffusion_time = inputs['diffusion_time']
 
             return {
-                    "score": self.dit(
-                        sampled_trajectories, 
-                        diffusion_time,
-                        ego_neighbor_encoding,
-                        route_lanes,
-                        neighbor_current_mask
-                    ).reshape(B, P, -1, 4)
-                }
+                "score": self.dit(
+                    sampled_trajectories,
+                    diffusion_time,
+                    ego_neighbor_encoding,
+                    route_lanes,
+                    neighbor_current_mask
+                ).reshape(B, P, -1)  # (B, P, 16*D)
+            }
         else:
-            # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
-            xT = torch.cat([current_states[:, :, None], torch.randn(B, P, self._future_len, 4).to(current_states.device) * 0.5], dim=2).reshape(B, P, -1)
+            # xT: pure noise in token embedding space (B, P, 16*D)
+            # std=1.0 matches the N(0,1) normalized embedding targets used in training
+            xT = torch.randn(B, P, self._k_tokens * self._token_emb_dim,
+                             device=current_states.device)
 
-            def initial_state_constraint(xt, t, step):
-                xt = xt.reshape(B, P, -1, 4)
-                xt[:, :, 0, :] = current_states
-                return xt.reshape(B, P, -1)
-            
             x0 = dpm_sampler(
                         self.dit,
                         xT,
                         other_model_params={
-                            "cross_c": ego_neighbor_encoding, 
+                            "cross_c": ego_neighbor_encoding,
                             "route_lanes": route_lanes,
-                            "neighbor_current_mask": neighbor_current_mask                            
+                            "neighbor_current_mask": neighbor_current_mask
                         },
-                        dpm_solver_params={
-                            "correcting_xt_fn":initial_state_constraint,
-                        },
+                        dpm_solver_params={},  # no initial-state constraint in embedding space
                         model_wrapper_params={
                             "classifier_fn": self._guidance_fn,
                             "classifier_kwargs": {
                                 "model": self.dit,
                                 "model_condition": {
-                                    "cross_c": ego_neighbor_encoding, 
+                                    "cross_c": ego_neighbor_encoding,
                                     "route_lanes": route_lanes,
-                                    "neighbor_current_mask": neighbor_current_mask                            
+                                    "neighbor_current_mask": neighbor_current_mask
                                 },
                                 "inputs": inputs,
                                 "observation_normalizer": self._observation_normalizer,
                                 "state_normalizer": self._state_normalizer
                             },
-                            "guidance_scale": 0.5,
+                            "guidance_scale": self._guidance_scale,
                             "guidance_type": "classifier" if self._guidance_fn is not None else "uncond"
                         },
                 )
-            x0 = self._state_normalizer.inverse(x0.reshape(B, P, -1, 4))[:, :, 1:]
+            # x0: (B, P, 16*D) — continuous embeddings output by DiT
+            D   = self._token_emb_dim
+            K   = self._k_tokens
+            P1  = P - 1
+
+            # ── Nearest-neighbor lookup: ego ────────────────────────────────
+            x0_ego    = x0[:, 0].reshape(B * K, D)                          # (B*16, D)
+            ego_emb_w = self.ego_token_emb.weight[3:]                       # (V_ego, D)
+            ego_ids   = torch.cdist(x0_ego, ego_emb_w).argmin(dim=-1).reshape(B, K) + 3
+
+            # ── Nearest-neighbor lookup: neighbor ───────────────────────────
+            x0_nbr    = x0[:, 1:].reshape(B * P1 * K, D)                   # (B*P1*16, D)
+            nbr_emb_w = self.nbr_token_emb.weight[3:]                       # (V_nbr, D)
+            nbr_ids   = torch.cdist(x0_nbr, nbr_emb_w).argmin(dim=-1).reshape(B, P1, K) + 3
+
+            # ── Add BOS=1 and EOS=2 ─────────────────────────────────────────
+            bos_1  = torch.ones (B,      1,  dtype=torch.long, device=x0.device)
+            eos_1  = torch.full ((B,      1), 2, dtype=torch.long, device=x0.device)
+            bos_P1 = torch.ones (B, P1,  1,  dtype=torch.long, device=x0.device)
+            eos_P1 = torch.full ((B, P1,  1), 2, dtype=torch.long, device=x0.device)
+
+            ego_full_ids = torch.cat([bos_1,  ego_ids,               eos_1 ], dim=1)  # (B, 18)
+            nbr_full_ids = torch.cat([bos_P1, nbr_ids, eos_P1], dim=2)                # (B, P1, 18)
+
+            # ── Decode token IDs → continuous trajectories ───────────────────
+            ego_future = self.ego_traj_decoder.decode_tokens(ego_full_ids)   # (B, 80, 4)
+            nbr_future = self.nbr_traj_decoder.decode_tokens(
+                nbr_full_ids.reshape(B * P1, 18)
+            ).reshape(B, P1, self._future_len, 4)                            # (B, P1, 80, 4)
+
+            prediction = torch.cat([ego_future.unsqueeze(1), nbr_future], dim=1)  # (B, P, 80, 4)
 
             return {
-                    "prediction": x0
+                    "prediction": prediction
                 }
 
         
@@ -184,7 +269,7 @@ class RouteEncoder(nn.Module):
 
         x = self.emb_project(self.norm(x))
 
-        x_result = torch.zeros((B, x.shape[-1]), device=x.device)
+        x_result = torch.zeros((B, x.shape[-1]), device=x.device, dtype=x.dtype)
         x_result[valid_indices] = x  # Fill in valid parts
         
         return x_result.view(B, -1)
@@ -198,7 +283,7 @@ class DiT(nn.Module):
         self._model_type = model_type
         self.route_encoder = route_encoder
         self.agent_embedding = nn.Embedding(2, hidden_dim)
-        self.preproj = Mlp(in_features=output_dim, hidden_features=512, out_features=hidden_dim, act_layer=nn.GELU, drop=0.)
+        self.preproj = Mlp(in_features=output_dim, hidden_features=max(512, output_dim // 2), out_features=hidden_dim, act_layer=nn.GELU, drop=0.)
         self.t_embedder = TimestepEmbedder(hidden_dim)
         self.blocks = nn.ModuleList([DiTBlock(hidden_dim, heads, dropout, mlp_ratio) for i in range(depth)])
         self.final_layer = FinalLayer(hidden_dim, output_dim)

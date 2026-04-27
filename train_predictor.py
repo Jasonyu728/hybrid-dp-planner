@@ -34,6 +34,12 @@ def get_args():
     parser.add_argument('--name', type=str, help='log name (default: "diffusion-planner-training")', default="diffusion-planner-training")
     parser.add_argument('--save_dir', type=str, help='save dir for model ckpt', default=".")
 
+    # vocab 路径：ego 专用词表（必填），neighbor 专用词表（可选，默认与 ego 共用）
+    parser.add_argument('--vocab_path',     type=str, required=True,
+                        help='ego 专用词表路径（如 ego_vocab_512.npz）')
+    parser.add_argument('--nbr_vocab_path', type=str, default=None,
+                        help='neighbor 专用词表路径（如 nbr_vocab_1024.npz）；不指定则与 ego 共用词表')
+
     # Data
     parser.add_argument('--train_set', type=str, help='path to train data', default=None)
     parser.add_argument('--train_set_list', type=str, help='data list of train data', default=None)
@@ -86,6 +92,7 @@ def get_args():
     parser.add_argument('--num_heads', type=int, help='number of multi-head', default=6)
     parser.add_argument('--hidden_dim', type=int, help='hidden dimension', default=192)
     parser.add_argument('--diffusion_model_type', type=str, help='type of diffusion model [x_start, score]', choices=['score', 'x_start'], default='x_start')
+    parser.add_argument('--token_emb_dim', type=int, help='dimension of each token embedding vector (default: 64)', default=64)
 
     # decoder
     parser.add_argument('--predicted_neighbor_num', type=int, help='number of neighbor agents to predict', default=10)
@@ -102,7 +109,8 @@ def get_args():
 
     args.state_normalizer = StateNormalizer.from_json(args)
     args.observation_normalizer = ObservationNormalizer.from_json(args)
-    
+    args.guidance_fn = None
+
     return args
 
 def model_training(args):
@@ -120,8 +128,8 @@ def model_training(args):
         if args.resume_model_path is not None:
             save_path = args.resume_model_path
         else:
-            from datetime import datetime
-            time = datetime.now()
+            from datetime import datetime, timezone, timedelta
+            time = datetime.now(timezone(timedelta(hours=8)))
             time = time.strftime("%Y-%m-%d-%H:%M:%S")
 
             save_path = f"{args.save_dir}/training_log/{args.name}/{time}/"
@@ -152,7 +160,7 @@ def model_training(args):
     if global_rank == 0:
         print("Dataset Prepared: {} train data\n".format(len(train_set)))
 
-    if args.ddp:
+    if args.ddp and torch.distributed.is_initialized():
         torch.distributed.barrier()
 
     # set up model
@@ -160,7 +168,8 @@ def model_training(args):
     diffusion_planner = diffusion_planner.to(rank if args.device == 'cuda' else args.device)
 
     if args.ddp:
-        diffusion_planner = DDP(diffusion_planner, device_ids=[rank])
+        diffusion_planner = DDP(diffusion_planner, device_ids=[rank], find_unused_parameters=False)
+        diffusion_planner._set_static_graph()
 
     if args.use_ema:
         model_ema = ModelEma(
@@ -188,7 +197,7 @@ def model_training(args):
     # logger
     wandb_logger = Logger(args.name, args.notes, args, wandb_resume_id=wandb_id, save_path=save_path, rank=global_rank) 
 
-    if args.ddp:
+    if args.ddp and torch.distributed.is_initialized():
         torch.distributed.barrier()
 
     # begin training

@@ -1,0 +1,43 @@
+# CHANGELOG
+
+## [v6] 2026-04-27
+
+### `diffusion_planner/train_epoch.py`
+
+**新增 `loss_smooth`（smoothness loss），权重 0.1**
+
+- **动机**：nuPlan Comfort 指标仅 8.33%，根本原因是 token 边界处速度不连续，导致加速度（jerk）超出舒适阈值。每个 token 在 decode 时是独立的局部运动段，段与段之间速度跳变无法通过 reconstruction loss 消除。
+- **实现**：在 `_differentiable_decode` 得到可微分重建轨迹 `traj_rec (B, 80, 3)` 后，对 xy 坐标的二阶有限差分施加 L2 惩罚：
+  ```python
+  vel         = traj_rec[:, 1:, :2] - traj_rec[:, :-1, :2]   # (B, 79, 2) 速度
+  acc         = vel[:, 1:] - vel[:, :-1]                      # (B, 78, 2) 加速度
+  loss_smooth = (acc ** 2).mean()
+  ```
+- **效果**：训练时模型被迫选择加速度小的 token 序列组合，边界处速度跳变受到惩罚。
+- **数值量级**：匀速场景 loss ≈ 0；token 边界跳变 0.5 m/s 时 loss ≈ 0.0025；0.1 权重不会淹没其余 loss 项。
+- **统计**：新增 `sum_loss_smooth` 累加器，loss_dict 新增 `smoothness_loss` 键。
+- **完整 loss**：`alpha * loss_ego + loss_nbr + 0.25 * loss_commit + 1.0 * loss_recon + 0.1 * loss_smooth`
+
+---
+
+## [v5] 2026-04-27
+- `train_epoch.py`: 新增 `_differentiable_decode`（soft NN → soft centroid → 滚动解码全局轨迹）和 `loss_recon`（与真实未来轨迹对比，权重 1.0），防止可训练 codebook 塌缩到 0；保存增强后的 `ego_future_gt` 用于重建监督；统计新增 `reconstruction_loss`
+
+## [v4] 2026-04-27
+- `train_predictor.py`: `find_unused_parameters=True` → `False`，新增 `_set_static_graph()`，修复 DDP 训练时 "Parameter marked as ready twice" 崩溃
+
+## [v3] 2026-04-27
+- `decoder.py`: embedding 表改为可训练（`requires_grad=True`），`preproj` hidden_features 改为 `max(512, output_dim//2)`
+- `train_epoch.py`: 移除 embedding 查表的 `no_grad`，加噪前对 x0 做 `detach`，loss 拆分为 diffusion loss + commitment loss（0.25 权重）
+- `train_predictor.py`: 删除 `--guidance_scale` 参数
+
+## [v2] 2026-04-27
+- `train_epoch.py`: ego loss 加入场景级权重（按轨迹位移，上限 2.0）和时序权重（前 4 个 token ×2）
+
+## [v1] 2026-04-26
+- `vocab_divide_token_v1_kmedoids.py`: 新增，基于 `vocab_divide_token_v1.py`，将 Stage 2 KMeans 替换为 KMedoids，`init='k-medoids++'`
+
+## [v0] 基线
+- `decoder.py`: 新增 `ego_token_emb` / `nbr_token_emb`（`nn.Embedding`）和 `ego_traj_decoder` / `nbr_traj_decoder`
+- `train_epoch.py`: token ID → embedding 空间扩散训练（原版为连续轨迹）
+- `token_trajectory_decoder.py`: 新增，token ID 序列解码为连续轨迹

@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder as m; import inspect; print\\(inspect.getfile\\(m\\)\\)\")",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:smart-motion.github.io)",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "WebFetch(domain:proceedings.neurips.cc)",
+      "Bash(cat \"D:\\\\\\\\新事务\\\\\\\\实验室\\\\\\\\交通模拟文件\\\\\\\\AD_yzy\\\\\\\\Diffusion-Planner\\\\\\\\diffusion_planner\\\\\\\\train_epoch.py\")",
+      "Bash(powershell.exe -Command \"Get-Content 'D:\\\\新事务\\\\实验室\\\\交通模拟文件\\\\AD_yzy\\\\Diffusion-Planner\\\\diffusion_planner\\\\train_epoch.py'\")",
+      "Bash(powershell.exe -Command \"ls 'D:\\\\新事务\\\\实验室\\\\交通模拟文件\\\\'\")",
+      "Bash(powershell.exe -Command \"Get-Content -Encoding UTF8 'D:\\\\新事务\\\\实验室\\\\交通模拟文件\\\\AD_yzy\\\\Diffusion-Planner\\\\diffusion_planner\\\\train_epoch.py'\")",
+      "Bash(python -c ' *)",
+      "Bash(python3 -c ' *)",
+      "Bash(cmd /c \"type \\\\\"D:\\\\新事务\\\\实验室\\\\交通模拟文件\\\\AD_yzy\\\\Diffusion-Planner\\\\diffusion_planner\\\\train_epoch.py\\\\\"\")",
+      "Bash(cmd /c \"dir \\\\\"D:\\\\新事务\\\\实验室\\\\交通模拟文件\\\\AD_yzy\\\\\"\")",
+      "Bash(powershell.exe -Command \"ls 'D:\\\\新事务\\\\实验室\\\\AD_yzy\\\\vocab' -ErrorAction SilentlyContinue; ls 'D:\\\\新事务\\\\实验室\\\\交通模拟文件\\\\vocab' -ErrorAction SilentlyContinue\")",
+      "Bash(powershell.exe -Command \"ls 'D:\\\\新事务\\\\实验室\\\\交通模拟文件\\\\AD_autodl\\\\Diffusion-Planner' | Select-Object -ExpandProperty Name\")",
+      "Bash(powershell.exe -Command \"ls 'D:\\\\新事务\\\\实验室\\\\交通模拟文件\\\\AD_autodl\\\\Diffusion-Planner\\\\vocab' | Select-Object Name,Length\")",
+      "Bash(powershell.exe -Command ' *)",
+      "PowerShell(python --version 2>&1)",
+      "PowerShell(python -c \"import numpy; print\\('numpy ok'\\)\" 2>&1)",
+      "PowerShell(conda run -n diffusion_planner_n python -c \"import numpy as np; data = np.load\\('d:/������/ʵ����/��ͨģ���ļ�/AD/Diffusion-Planner/npz_dataset/sg-one-north_07564ce70b6a5a23.npz', allow_pickle=False\\); [print\\(k, data[k].shape, data[k].dtype\\) for k in data.files]\" 2>&1)",
+      "PowerShell(head -30)"
+    ]
+  }
+}

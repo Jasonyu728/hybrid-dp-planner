@@ -1,5 +1,40 @@
 # CHANGELOG
 
+## [v7] 2026-04-28
+
+### `diffusion_planner/train_epoch.py`
+
+**移除 `time_w` 前 4 token 偏置**
+- 删除 `time_w[:4] = 2.0`，改为全 1 均匀权重。
+- 原因：800 eps 评估发现 Making 升至 100% 但 Collisions 跌至 8.33%，模型被迫在所有场景前 2s 预测高运动 token，遇到障碍物或红灯也强行前进导致碰撞。
+
+**新增 `loss_route`（route following loss），权重 0.1**
+- 动机：ego 出现乱开现象，Drivable 仅 25%。训练 loss 全在 embedding 空间，没有任何路线跟随信号。
+- 实现：将 `traj_rec[:, :, :2]`（可微分重建轨迹的 xy）与 `batch['route_lanes'][..., :2]` 展开的 500 个路线点做 `torch.cdist`，取每帧最近点距离后 `clamp(max=10.0).mean()`：
+  ```python
+  route_pts  = batch['route_lanes'][..., :2].reshape(B, -1, 2)   # (B, 500, 2)
+  route_valid = route_pts.abs().sum(-1) > 1e-3
+  dists      = torch.cdist(traj_rec[:, :, :2], route_pts)        # (B, 80, 500)
+  dists      += (~route_valid).unsqueeze(1).float() * 1e6
+  loss_route = dists.min(dim=-1).values.clamp(max=10.0).mean()
+  ```
+- clamp(max=10.0) 防止早期训练轨迹严重偏离时梯度爆炸。
+- 梯度链路：`loss_route → traj_rec → x0_ego → ego_token_emb`，同时约束 embedding 和 DiT。
+- 新增 `sum_loss_route` 统计，loss_dict 新增 `route_following_loss` 键。
+
+### `vocab_divide_token_v1.py`
+
+**新增 `_fix_duplicates` 方法**
+- 动机：n_init=30 时诊断仍显示 18 个近重复 token，增加 n_init 边际收益递减。
+- 实现：Stage 2 KMeans 完成后，在 scaled 空间中找出距离 < 1e-3 的重复 centroid 对，将重复槽位替换为距所有现有中心最远的数据点（从 50k 采样点中选）。新中心纳入排斥范围后依次处理，保证替换后互不重复。
+- `fit()` 中自动调用，`_diagnose()` 前执行，最终报告中近重复数应降为 0。
+
+### `.claude/commands/log.md`
+
+**更新 /log skill**：在更新 CHANGELOG 后自动 stage 相关文件并创建 git commit 快照，方便精确回退。
+
+---
+
 ## [v6] 2026-04-27
 
 ### `diffusion_planner/train_epoch.py`

@@ -176,6 +176,7 @@ def train_epoch(train_loader, model, optimizer, args, model_ema=None, aug=None):
     sum_loss_commit = 0.0
     sum_loss_recon  = 0.0
     sum_loss_smooth = 0.0
+    sum_loss_route  = 0.0
     sum_loss_total  = 0.0
     n_batches = 0
 
@@ -270,9 +271,7 @@ def train_epoch(train_loader, model, optimizer, args, model_ema=None, aug=None):
             traj_dist = tok_dist.mean(dim=1)                                  # (B,)
             scene_w = (1.0 + traj_dist / traj_dist.mean().clamp(min=1e-6)).clamp(max=2.0)  # (B,)
 
-            # 时序权重：前 4 个 token（前 2s）额外 ×2，促进 Making 的最低启动条件
             time_w = torch.ones(16, device=args.device)
-            time_w[:4] = 2.0                                                  # (16,)
 
         D_emb    = ego_token_emb.embedding_dim
         pred_ego = pred[:, 0].reshape(B, 16, D_emb)    # (B, 16, D)
@@ -300,11 +299,23 @@ def train_epoch(train_loader, model, optimizer, args, model_ema=None, aug=None):
         acc         = vel[:, 1:] - vel[:, :-1]                      # (B, 78, 2)
         loss_smooth = (acc ** 2).mean()
 
+        # Route following loss：惩罚轨迹偏离 route lane 中心线，解决 ego 乱开问题
+        # route_lanes: (B, 25, 20, 12)，前 2 维为 ego 坐标系下的 xy
+        route_pts  = batch['route_lanes'][..., :2].reshape(B, -1, 2)  # (B, 500, 2)
+        route_valid = route_pts.abs().sum(-1) > 1e-3                  # (B, 500)
+        traj_xy    = traj_rec[:, :, :2]                               # (B, 80, 2)
+        dists      = torch.cdist(traj_xy, route_pts)                  # (B, 80, 500)
+        # 填充无效 route 点，防止距离计算被 padding 零点干扰
+        dists      = dists + (~route_valid).unsqueeze(1).float() * 1e6
+        min_dists  = dists.min(dim=-1).values                         # (B, 80)
+        loss_route = min_dists.clamp(max=10.0).mean()
+
         loss = (args.alpha_planning_loss * loss_ego
                 + loss_nbr
                 + 0.25 * loss_commit
                 + 1.0  * loss_recon
-                + 0.1  * loss_smooth)
+                + 0.1  * loss_smooth
+                + 0.1  * loss_route)
 
         # ── 8. 反向传播 + 更新 ──────────────────────────────────────────
         optimizer.zero_grad()
@@ -321,6 +332,7 @@ def train_epoch(train_loader, model, optimizer, args, model_ema=None, aug=None):
         sum_loss_commit += loss_commit.item()
         sum_loss_recon  += loss_recon.item()
         sum_loss_smooth += loss_smooth.item()
+        sum_loss_route  += loss_route.item()
         sum_loss_total  += loss.item()
         n_batches       += 1
 
@@ -330,6 +342,7 @@ def train_epoch(train_loader, model, optimizer, args, model_ema=None, aug=None):
         'commitment_loss':          sum_loss_commit / max(n_batches, 1),
         'reconstruction_loss':      sum_loss_recon  / max(n_batches, 1),
         'smoothness_loss':          sum_loss_smooth / max(n_batches, 1),
+        'route_following_loss':     sum_loss_route  / max(n_batches, 1),
         'loss':                     sum_loss_total  / max(n_batches, 1),
     }
     total_loss = sum_loss_total / max(n_batches, 1)

@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## [v9] 2026-04-28
+
+### `diffusion_planner/train_epoch.py`
+
+**`loss_route` 权重 0.1 → 0.3**
+- 针对 Drivable 25% 问题加强路线约束，server 2（128维）专用配置。
+
+**新增 `loss_col`（collision avoidance loss），权重 0.05**
+- 动机：Collisions 8.33%、TTC 8.33%，route loss 只管在路上，不管撞不撞邻居。
+- 实现：用可微分重建轨迹 `traj_rec[:, :, :2]` 与 `batch['neighbor_agents_future'][:, :N_pred, :, :2]`（邻居 GT 未来 xy）计算逐帧距离，低于安全距离 3m 的部分产生惩罚：
+  ```python
+  nbr_dists = (ego_xy_e - nbr_xy).norm(dim=-1)   # (B, N, 80)
+  risk      = (3.0 - nbr_dists).clamp(min=0) * nbr_valid.unsqueeze(-1)
+  loss_col  = risk.mean()
+  ```
+- 权重 0.05 保守，避免早期训练梯度过大（risk 量级 0–3m）。
+- 新增 `sum_loss_col` 统计，loss_dict 新增 `collision_avoidance_loss` 键。
+
+---
+
 ## [v8] 2026-04-28
 
 ### `diffusion_planner/utils/token_trajectory_decoder.py`

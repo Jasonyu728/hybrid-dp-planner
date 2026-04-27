@@ -177,6 +177,7 @@ def train_epoch(train_loader, model, optimizer, args, model_ema=None, aug=None):
     sum_loss_recon  = 0.0
     sum_loss_smooth = 0.0
     sum_loss_route  = 0.0
+    sum_loss_col    = 0.0
     sum_loss_total  = 0.0
     n_batches = 0
 
@@ -305,17 +306,28 @@ def train_epoch(train_loader, model, optimizer, args, model_ema=None, aug=None):
         route_valid = route_pts.abs().sum(-1) > 1e-3                  # (B, 500)
         traj_xy    = traj_rec[:, :, :2]                               # (B, 80, 2)
         dists      = torch.cdist(traj_xy, route_pts)                  # (B, 80, 500)
-        # 填充无效 route 点，防止距离计算被 padding 零点干扰
         dists      = dists + (~route_valid).unsqueeze(1).float() * 1e6
         min_dists  = dists.min(dim=-1).values                         # (B, 80)
         loss_route = min_dists.clamp(max=10.0).mean()
+
+        # Collision avoidance loss：惩罚 ego 与邻居 GT 未来轨迹距离过近，改善 Collisions/TTC
+        # neighbor_agents_future: (B, 32, 80, 3)，前 2 维为 xy（ego 坐标系）
+        N_pred    = args.predicted_neighbor_num
+        nbr_xy    = batch['neighbor_agents_future'][:, :N_pred, :, :2]   # (B, N, 80, 2)
+        nbr_valid = nbr_xy.abs().sum(dim=(-1, -2)) > 1e-3                # (B, N) agent 是否存在
+        ego_xy_e  = traj_rec[:, :, :2].unsqueeze(1)                      # (B, 1, 80, 2)
+        nbr_dists = (ego_xy_e - nbr_xy).norm(dim=-1)                     # (B, N, 80)
+        safety    = 3.0   # 安全距离 3m
+        risk      = (safety - nbr_dists).clamp(min=0) * nbr_valid.unsqueeze(-1)
+        loss_col  = risk.mean()
 
         loss = (args.alpha_planning_loss * loss_ego
                 + loss_nbr
                 + 0.25 * loss_commit
                 + 1.0  * loss_recon
                 + 0.1  * loss_smooth
-                + 0.1  * loss_route)
+                + 0.3  * loss_route
+                + 0.05 * loss_col)
 
         # ── 8. 反向传播 + 更新 ──────────────────────────────────────────
         optimizer.zero_grad()
@@ -333,6 +345,7 @@ def train_epoch(train_loader, model, optimizer, args, model_ema=None, aug=None):
         sum_loss_recon  += loss_recon.item()
         sum_loss_smooth += loss_smooth.item()
         sum_loss_route  += loss_route.item()
+        sum_loss_col    += loss_col.item()
         sum_loss_total  += loss.item()
         n_batches       += 1
 
@@ -343,6 +356,7 @@ def train_epoch(train_loader, model, optimizer, args, model_ema=None, aug=None):
         'reconstruction_loss':      sum_loss_recon  / max(n_batches, 1),
         'smoothness_loss':          sum_loss_smooth / max(n_batches, 1),
         'route_following_loss':     sum_loss_route  / max(n_batches, 1),
+        'collision_avoidance_loss': sum_loss_col    / max(n_batches, 1),
         'loss':                     sum_loss_total  / max(n_batches, 1),
     }
     total_loss = sum_loss_total / max(n_batches, 1)

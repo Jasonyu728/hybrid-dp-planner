@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## [v8] 2026-04-28
+
+### `diffusion_planner/utils/token_trajectory_decoder.py`
+
+**推理平滑 sigma：1.0 → 2.0**
+- 高斯核 sigma 从 1.0 加大到 2.0，对 token 边界处的速度跳变施加更强平滑。
+- 纯推理侧改动，不需要重新训练，直接用现有 checkpoint 重跑评估即可观察 Comfort 变化。
+
+---
+
 ## [v7] 2026-04-28
 
 ### `diffusion_planner/train_epoch.py`

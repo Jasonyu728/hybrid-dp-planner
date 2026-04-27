@@ -137,9 +137,9 @@ class TokenTrajectoryDecoder(nn.Module):
         device   = traj_xyh.device
         dtype    = traj_xyh.dtype
 
-        # 高斯核：window=5, sigma=1.0
+        # 高斯核：window=5, sigma=2.0（更强平滑，抑制 token 边界 jerk，改善 Comfort）
         kernel_size = 5
-        sigma = 1.0
+        sigma = 2.0
         k = torch.arange(kernel_size, device=device, dtype=dtype) - kernel_size // 2
         kernel = torch.exp(-k ** 2 / (2.0 * sigma ** 2))
         kernel = (kernel / kernel.sum()).view(1, 1, kernel_size)

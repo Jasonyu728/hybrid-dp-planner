@@ -33,7 +33,7 @@ echo "Processing $CKPT_FILE..."
 FILENAME=$(basename "$CKPT_FILE")
 FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}"
 
-PLANNER=diffusion_planner_guidance
+PLANNER=diffusion_planner_token_guidance
 
 sudo -E /data/anaconda3/envs/nuplan/bin/python $NUPLAN_DEVKIT_ROOT/nuplan/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \

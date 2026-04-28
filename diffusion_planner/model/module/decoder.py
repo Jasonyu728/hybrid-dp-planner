@@ -186,7 +186,12 @@ class Decoder(nn.Module):
                                 },
                                 "inputs": inputs,
                                 "observation_normalizer": self._observation_normalizer,
-                                "state_normalizer": self._state_normalizer
+                                "state_normalizer": self._state_normalizer,
+                                # Token guidance: embedding tables and centroids
+                                "ego_emb_w":     self.ego_token_emb.weight[3:].detach(),
+                                "nbr_emb_w":     self.nbr_token_emb.weight[3:].detach(),
+                                "ego_centroids": self.ego_traj_decoder.centroids.detach(),
+                                "nbr_centroids": self.nbr_traj_decoder.centroids.detach(),
                             },
                             "guidance_scale": self._guidance_scale,
                             "guidance_type": "classifier" if self._guidance_fn is not None else "uncond"

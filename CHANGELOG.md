@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## [v11] 2026-04-28
+
+- `diffusion_planner/utils/diff_decode.py`: 新增，将 `_differentiable_decode` 提取为共享工具函数（training + guidance 两处复用）。
+- `diffusion_planner/train_epoch.py`: 将内联的 `_differentiable_decode` 替换为从 `utils.diff_decode` 的 import。
+- `diffusion_planner/model/guidance/token_collision.py`: 新增，实现 token embedding 空间的碰撞 guidance 函数（SAT 矩形碰撞检测，梯度路径通过 `_differentiable_decode` 回传到 ego embedding）。
+- `diffusion_planner/model/guidance/guidance_wrapper.py`: 新增 `TokenGuidanceWrapper`（token 版 guidance wrapper，使用 x0 预测值替换 xt 做几何计算，同时保留 xt 的梯度路径）。
+- `diffusion_planner/model/module/decoder.py`: 推理路径 `classifier_kwargs` 新增 `ego_emb_w`、`nbr_emb_w`、`ego_centroids`、`nbr_centroids`，供 `token_collision_guidance_fn` 调用。
+- `diffusion_planner/config/planner/diffusion_planner_token_guidance.yaml`: 新增，planner 配置文件，`guidance_fn` 指向 `TokenGuidanceWrapper`。
+- `sim_guidance_demo.sh`: `PLANNER` 从 `diffusion_planner_guidance` 改为 `diffusion_planner_token_guidance`。
+
+---
+
 ## [v10] 2026-04-28
 
 - `diffusion_planner/train_epoch.py`: 移除 `loss_smooth`、`loss_route`、`loss_col` 及其统计变量，loss 恢复为 diffusion + commitment(0.25) + reconstruction(1.0) 三项干净版本。

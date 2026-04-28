@@ -20,60 +20,7 @@ DiffusionPlanner 的训练循环。
 import torch
 import torch.nn as nn
 
-
-def _differentiable_decode(
-    x_emb: torch.Tensor,    # (B, 16, D)
-    emb_w: torch.Tensor,    # (V, D)   codebook（剔除 PAD/BOS/EOS）
-    centroids: torch.Tensor,# (V, 15)  固定 centroid（5 帧 × [dx,dy,dh]，局部坐标系）
-    token_step: int = 5,
-    tau: float = 1.0,
-) -> torch.Tensor:           # (B, 80, 3)  [x, y, heading]，全局坐标系（起点 0,0,0）
-    """
-    可微分轨迹重建：embedding → 软最近邻 → 软 centroid → 滚动解码全局轨迹。
-
-    embedding 一旦塌缩，soft_w 退化为均匀分布 → soft_seg = centroids 平均
-    → 解码出"平均轨迹"，与每个样本的真实未来差距大 → 重建 loss 反向把
-    embedding 推回到几何分离的状态。
-    """
-    B, K, _ = x_emb.shape
-
-    # ── ① soft NN over codebook ────────────────────────────────
-    dist   = torch.cdist(x_emb, emb_w)               # (B, 16, V)
-    soft_w = torch.softmax(-dist / tau, dim=-1)      # (B, 16, V)
-
-    # ── ② soft centroid ─────────────────────────────────────────
-    soft_seg = soft_w @ centroids                     # (B, 16, 15)
-    soft_seg = soft_seg.view(B, K, token_step, 3)     # (B, 16, 5, 3)
-
-    # ── ③ 滚动解码 local → global ──────────────────────────────
-    x_ref = torch.zeros(B, device=x_emb.device, dtype=x_emb.dtype)
-    y_ref = torch.zeros(B, device=x_emb.device, dtype=x_emb.dtype)
-    h_ref = torch.zeros(B, device=x_emb.device, dtype=x_emb.dtype)
-
-    frames = []
-    for i in range(K):
-        cos_h = torch.cos(h_ref)
-        sin_h = torch.sin(h_ref)
-
-        for j in range(token_step):
-            dx_l = soft_seg[:, i, j, 0]
-            dy_l = soft_seg[:, i, j, 1]
-            dh_l = soft_seg[:, i, j, 2]
-            x_g = x_ref + cos_h * dx_l - sin_h * dy_l
-            y_g = y_ref + sin_h * dx_l + cos_h * dy_l
-            h_g = h_ref + dh_l
-            frames.append(torch.stack([x_g, y_g, h_g], dim=-1))   # (B, 3)
-
-        # rolling 参考点用 token 最后一帧（与 _tokenize_v5_batch 一致）
-        dx_last = soft_seg[:, i, -1, 0]
-        dy_last = soft_seg[:, i, -1, 1]
-        dh_last = soft_seg[:, i, -1, 2]
-        x_ref = x_ref + cos_h * dx_last - sin_h * dy_last
-        y_ref = y_ref + sin_h * dx_last + cos_h * dy_last
-        h_ref = torch.atan2(torch.sin(h_ref + dh_last),
-                            torch.cos(h_ref + dh_last))
-
-    return torch.stack(frames, dim=1)                 # (B, 80, 3)
+from diffusion_planner.utils.diff_decode import _differentiable_decode
 
 
 def _tokenize_v5_batch(

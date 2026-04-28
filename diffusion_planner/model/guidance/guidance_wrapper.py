@@ -3,6 +3,7 @@ import torch
 
 from diffusion_planner.model.diffusion_utils.sde import VPSDE_linear
 from diffusion_planner.model.guidance.collision import collision_guidance_fn
+from diffusion_planner.model.guidance.token_collision import token_collision_guidance_fn
 
 N = 1
 sde = VPSDE_linear()
@@ -50,5 +51,41 @@ class GuidanceWrapper:
         # energy = energy1 if energy2 < 1 else energy2
         
         assert not torch.isnan(energy).any()
-          
+
+        return energy
+
+
+class TokenGuidanceWrapper:
+    """
+    Guidance wrapper for token-embedding-space diffusion.
+
+    Unlike GuidanceWrapper (continuous trajectories), this wrapper:
+    - Does NOT apply state_normalizer.inverse (token embeddings are not normalized trajectories)
+    - Uses the model's x0 estimate value while keeping the gradient path through xt
+    - Passes decoded ego geometry to token_collision_guidance_fn via _differentiable_decode
+    """
+    def __init__(self):
+        self._guidance_fns = [token_collision_guidance_fn]
+
+    def __call__(self, x_in, t_input, cond, *args, **kwargs):
+        B, P, _ = x_in.shape
+        model             = kwargs["model"]
+        model_condition   = kwargs["model_condition"]
+        observation_normalizer = kwargs["observation_normalizer"]
+
+        # Replace xt value with x0_pred (cleaner geometry) while keeping
+        # the gradient path through x_in.  x_fix is detached, so
+        # ∂(x_effective)/∂x_in = I — autograd still reaches x_in.
+        x0_pred    = model(x_in, t_input, **model_condition).detach()
+        x_fix      = x0_pred - x_in.detach()
+        x_effective = x_in + x_fix   # value ≈ x0_pred, gradient path = x_in
+
+        # Inverse-normalize inputs so physical units (meters) are correct
+        kwargs["inputs"] = observation_normalizer.inverse(kwargs["inputs"])
+
+        energy = torch.zeros(1, device=x_in.device)
+        for guidance_fn in self._guidance_fns:
+            energy = energy + guidance_fn(x_effective, t_input, cond, **kwargs)
+
+        assert not torch.isnan(energy).any()
         return energy

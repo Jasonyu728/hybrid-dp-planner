@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## [v10] 2026-04-28
+
+- `diffusion_planner/train_epoch.py`: 移除 `loss_smooth`、`loss_route`、`loss_col` 及其统计变量，loss 恢复为 diffusion + commitment(0.25) + reconstruction(1.0) 三项干净版本。
+
+---
+
 ## [v9] 2026-04-28
 
 ### `diffusion_planner/train_epoch.py`

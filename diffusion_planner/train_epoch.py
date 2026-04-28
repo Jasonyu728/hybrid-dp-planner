@@ -175,9 +175,6 @@ def train_epoch(train_loader, model, optimizer, args, model_ema=None, aug=None):
     sum_loss_nbr    = 0.0
     sum_loss_commit = 0.0
     sum_loss_recon  = 0.0
-    sum_loss_smooth = 0.0
-    sum_loss_route  = 0.0
-    sum_loss_col    = 0.0
     sum_loss_total  = 0.0
     n_batches = 0
 
@@ -295,39 +292,10 @@ def train_epoch(train_loader, model, optimizer, args, model_ema=None, aug=None):
         traj_rec      = _differentiable_decode(x0_ego, ego_emb_w, ego_centroids)
         loss_recon    = ((traj_rec - ego_future_gt) ** 2).mean()
 
-        # Smoothness loss：惩罚轨迹加速度（二阶差分），抑制 token 边界处的 jerk
-        vel         = traj_rec[:, 1:, :2] - traj_rec[:, :-1, :2]   # (B, 79, 2)
-        acc         = vel[:, 1:] - vel[:, :-1]                      # (B, 78, 2)
-        loss_smooth = (acc ** 2).mean()
-
-        # Route following loss：惩罚轨迹偏离 route lane 中心线，解决 ego 乱开问题
-        # route_lanes: (B, 25, 20, 12)，前 2 维为 ego 坐标系下的 xy
-        route_pts  = batch['route_lanes'][..., :2].reshape(B, -1, 2)  # (B, 500, 2)
-        route_valid = route_pts.abs().sum(-1) > 1e-3                  # (B, 500)
-        traj_xy    = traj_rec[:, :, :2]                               # (B, 80, 2)
-        dists      = torch.cdist(traj_xy, route_pts)                  # (B, 80, 500)
-        dists      = dists + (~route_valid).unsqueeze(1).float() * 1e6
-        min_dists  = dists.min(dim=-1).values                         # (B, 80)
-        loss_route = min_dists.clamp(max=10.0).mean()
-
-        # Collision avoidance loss：惩罚 ego 与邻居 GT 未来轨迹距离过近，改善 Collisions/TTC
-        # neighbor_agents_future: (B, 32, 80, 3)，前 2 维为 xy（ego 坐标系）
-        N_pred    = args.predicted_neighbor_num
-        nbr_xy    = batch['neighbor_agents_future'][:, :N_pred, :, :2]   # (B, N, 80, 2)
-        nbr_valid = nbr_xy.abs().sum(dim=(-1, -2)) > 1e-3                # (B, N) agent 是否存在
-        ego_xy_e  = traj_rec[:, :, :2].unsqueeze(1)                      # (B, 1, 80, 2)
-        nbr_dists = (ego_xy_e - nbr_xy).norm(dim=-1)                     # (B, N, 80)
-        safety    = 3.0   # 安全距离 3m
-        risk      = (safety - nbr_dists).clamp(min=0) * nbr_valid.unsqueeze(-1)
-        loss_col  = risk.mean()
-
         loss = (args.alpha_planning_loss * loss_ego
                 + loss_nbr
                 + 0.25 * loss_commit
-                + 1.0  * loss_recon
-                + 0.1  * loss_smooth
-                + 0.3  * loss_route
-                + 0.05 * loss_col)
+                + 1.0  * loss_recon)
 
         # ── 8. 反向传播 + 更新 ──────────────────────────────────────────
         optimizer.zero_grad()
@@ -343,9 +311,6 @@ def train_epoch(train_loader, model, optimizer, args, model_ema=None, aug=None):
         sum_loss_nbr    += loss_nbr.item()
         sum_loss_commit += loss_commit.item()
         sum_loss_recon  += loss_recon.item()
-        sum_loss_smooth += loss_smooth.item()
-        sum_loss_route  += loss_route.item()
-        sum_loss_col    += loss_col.item()
         sum_loss_total  += loss.item()
         n_batches       += 1
 
@@ -354,9 +319,6 @@ def train_epoch(train_loader, model, optimizer, args, model_ema=None, aug=None):
         'neighbor_prediction_loss': sum_loss_nbr    / max(n_batches, 1),
         'commitment_loss':          sum_loss_commit / max(n_batches, 1),
         'reconstruction_loss':      sum_loss_recon  / max(n_batches, 1),
-        'smoothness_loss':          sum_loss_smooth / max(n_batches, 1),
-        'route_following_loss':     sum_loss_route  / max(n_batches, 1),
-        'collision_avoidance_loss': sum_loss_col    / max(n_batches, 1),
         'loss':                     sum_loss_total  / max(n_batches, 1),
     }
     total_loss = sum_loss_total / max(n_batches, 1)

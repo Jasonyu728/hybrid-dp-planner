@@ -32,6 +32,17 @@ vocab_v3.py
       --save    vocab/nbr_vocab_1024.npz \\
       --vocab_size 1024 --source nbr --angle_weight auto \\
       --stratify --n_buckets 8
+
+推荐的两步流程（消除聚类 reference 与 encode/decode 不一致）
+----------------------------------------------------------
+  # Pass 1：GT-reference 跑一遍，得到 seed vocab
+  python vocab_v3.py --npz_dir ... --save vocab/ego_seed.npz \\
+      --source ego --angle_weight auto
+
+  # Pass 2：用 seed vocab 做 rolling-reference 提取，再 fit 出最终 vocab
+  python vocab_v3.py --npz_dir ... --save vocab/ego_vocab_1024.npz \\
+      --source ego --angle_weight auto \\
+      --reference_mode rolling --rolling_vocab vocab/ego_seed.npz
 """
 
 from __future__ import annotations
@@ -93,6 +104,65 @@ def extract_segments(future_traj: np.ndarray) -> np.ndarray:
     # 交错堆叠为 [dx_0, dy_0, dh_0, dx_1, dy_1, dh_1, ...]
     segs = np.stack([dx_l, dy_l, dh_l], axis=-1).reshape(n_full, SEG_DIM)
     return segs.astype(np.float32)
+
+
+def extract_segments_rolling(future_traj: np.ndarray, vocab: "MotionVocabulary") -> np.ndarray:
+    """
+    用 rolling reference 提取 15D segments，参考点 = 上一段 chosen token centroid 最末帧。
+    与 tokenize_future_traj_v5 / _tokenize_v5_batch / TokenTrajectoryDecoder._decode_v5 同口径。
+
+    需要预先有一个 seed vocab：通常是先用 reference_mode='gt' fit 一次得到的。
+    上层 collect_segments 已经用 _is_valid_nbr_traj 截断了无效末段，本函数不再做 mid-block
+    early-stop，避免双层语义。
+    """
+    vocab._check()
+    if vocab.centroids.shape[1] != SEG_DIM:
+        raise ValueError("rolling reference extraction requires a 15D vocab")
+
+    n_full = min(len(future_traj) // TOKEN_STEP, K_TOKENS)
+    if n_full == 0:
+        return np.zeros((0, SEG_DIM), dtype=np.float32)
+
+    # 预先 cache scaled centroids，避免每个 segment 都重新 _scale
+    centroids = vocab.centroids                            # (V, 15)
+    scaled_centroids = vocab._scale(centroids)             # (V, 15)
+    angle_weight = float(vocab.angle_weight)
+    last_frame_offset = (TOKEN_STEP - 1) * 3
+
+    blocks = future_traj[:n_full * TOKEN_STEP].reshape(n_full, TOKEN_STEP, 3).astype(np.float32)
+
+    segs = np.empty((n_full, SEG_DIM), dtype=np.float32)
+    x_ref = 0.0
+    y_ref = 0.0
+    h_ref = 0.0
+
+    for i in range(n_full):
+        cos_h = np.cos(h_ref)
+        sin_h = np.sin(h_ref)
+
+        block = blocks[i]
+        dx_g = block[:, 0] - x_ref
+        dy_g = block[:, 1] - y_ref
+        dx_l = cos_h * dx_g + sin_h * dy_g
+        dy_l = -sin_h * dx_g + cos_h * dy_g
+        dh_l = _wrap_angle(block[:, 2] - h_ref)
+        seg = np.stack([dx_l, dy_l, dh_l], axis=-1).reshape(SEG_DIM).astype(np.float32)
+        segs[i] = seg
+
+        # 内联 argmin：避免 vocab.encode 的 _scale + chunk 开销
+        seg_sc = seg.copy()
+        seg_sc[2::3] *= angle_weight
+        raw = int(np.argmin(((scaled_centroids - seg_sc) ** 2).sum(axis=-1)))
+
+        # 用 chosen token 最末帧更新 rolling reference
+        dx_c = float(centroids[raw, last_frame_offset + 0])
+        dy_c = float(centroids[raw, last_frame_offset + 1])
+        dh_c = float(centroids[raw, last_frame_offset + 2])
+        x_ref = x_ref + cos_h * dx_c - sin_h * dy_c
+        y_ref = y_ref + sin_h * dx_c + cos_h * dy_c
+        h_ref = float(_wrap_angle(np.array([h_ref + dh_c]))[0])
+
+    return segs
 
 
 # ── 数据过滤 ─────────────────────────────────────────────────────────────────
@@ -222,7 +292,9 @@ def collect_segments(npz_dir: str,
                      max_stationary_ratio: float = 0.15,
                      stratify: bool = False,
                      n_buckets: int = 8,
-                     source: str = 'all') -> np.ndarray:
+                     source: str = 'all',
+                     reference_mode: str = 'gt',
+                     rolling_vocab: Optional["MotionVocabulary"] = None) -> np.ndarray:
     """
     遍历 .npz 目录，收集 15D segments 并过滤噪声。
 
@@ -233,6 +305,15 @@ def collect_segments(npz_dir: str,
     n_buckets  : 分层桶数
     """
     assert source in ('all', 'ego', 'nbr'), f"source 须为 all/ego/nbr，实际 {source}"
+    assert reference_mode in ('gt', 'rolling'), "reference_mode must be 'gt' or 'rolling'"
+    if reference_mode == 'rolling' and rolling_vocab is None:
+        raise ValueError("reference_mode='rolling' requires rolling_vocab")
+
+    def _extract(traj: np.ndarray) -> np.ndarray:
+        if reference_mode == 'rolling':
+            return extract_segments_rolling(traj, rolling_vocab)
+        return extract_segments(traj)
+
     files = sorted(Path(npz_dir).rglob("*.npz"))
     if max_files:
         files = files[:max_files]
@@ -252,7 +333,7 @@ def collect_segments(npz_dir: str,
             continue
 
         if source in ('all', 'ego') and "ego_agent_future" in data:
-            s = extract_segments(data["ego_agent_future"])
+            s = _extract(data["ego_agent_future"])
             if len(s):
                 all_segs.append(s)
 
@@ -264,7 +345,7 @@ def collect_segments(npz_dir: str,
                 if not ok:
                     n_nbr_skip += 1
                     continue
-                s = extract_segments(nbr[n, :end])
+                s = _extract(nbr[n, :end])
                 if len(s):
                     all_segs.append(s)
 
@@ -385,17 +466,21 @@ class MotionVocabulary:
 
     def _fix_duplicates(self, X_scaled: np.ndarray, min_dist: float = 1e-3):
         """
-        将近重复 centroid（scaled 空间距离 < min_dist）替换为距所有现有中心最远的数据点。
+        将近重复 centroid 替换为距所有现有中心最远的数据点。
         保持 vocab_size 不变，消除浪费的槽位。
-        """
-        C = self._scale(self._centroids)
 
-        # 找出所有重复槽位（保留每对中的第一个）
-        dup = np.zeros(len(C), dtype=bool)
-        for i in range(len(C)):
+        检测在 unscaled 空间进行（与 _diagnose 口径一致），替换在 scaled 空间进行。
+        之前用 scaled 空间检测时，9e-5 unscaled × angle_weight ≈ 1.5e-3 > 阈值，导致漏检。
+        """
+        C_raw = self._centroids                   # unscaled，与 _diagnose 一致
+        C_sc  = self._scale(self._centroids)      # scaled，用于替换候选点选取
+
+        # 用 unscaled 空间检测重复（阈值 1e-3 对应物理距离约 1mm）
+        dup = np.zeros(len(C_raw), dtype=bool)
+        for i in range(len(C_raw)):
             if dup[i]:
                 continue
-            dists = np.linalg.norm(C[i] - C, axis=1)
+            dists = np.linalg.norm(C_raw[i] - C_raw, axis=1)
             dists[i] = np.inf
             dup |= (dists < min_dist) & ~dup
 
@@ -409,15 +494,14 @@ class MotionVocabulary:
         sample_idx = rng.choice(len(X_scaled), min(50_000, len(X_scaled)), replace=False)
         X_sample = X_scaled[sample_idx]
 
-        active = C[~dup]                          # 当前非重复中心
+        active = C_sc[~dup]
         for slot in np.where(dup)[0]:
-            # 每个候选点到最近非重复中心的距离
             d = np.linalg.norm(X_sample[:, None] - active[None], axis=-1).min(axis=1)
             best = X_sample[d.argmax()]
-            C[slot] = best
-            active = np.vstack([active, best])    # 新中心也纳入排斥范围
+            C_sc[slot] = best
+            active = np.vstack([active, best])
 
-        self._centroids = self._unscale(C).astype(np.float32)
+        self._centroids = self._unscale(C_sc).astype(np.float32)
         print(f"[Dedup] 完成，替换了 {n_dup} 个重复槽位")
 
     # —— 自动诊断 ——————————————————————————————————————————————————————————
@@ -435,9 +519,7 @@ class MotionVocabulary:
         n_dup_strict = int((min_dists < 1e-3).sum())
         n_dup_loose  = int((min_dists < 0.01).sum())
 
-        # 2. 静止 token 占比
-        cum_disp = np.sqrt(C[:, 0::3].sum(axis=1)**2 + C[:, 1::3].sum(axis=1)**2)
-        # 注：上行用各段累积反推全局位移；保留与 cap_stationary 一致的口径再算一遍
+        # 2. 静止 token 占比，与 cap_stationary 使用同一末帧位移口径。
         end_disp = np.sqrt(C[:, 12]**2 + C[:, 13]**2)
         static_rate = float((end_disp < 0.5).mean())
 
@@ -569,8 +651,16 @@ if __name__ == "__main__":
     parser.add_argument("--stratify", action="store_true",  help="启用分层采样平衡速度分布（推荐 nbr 词表）")
     parser.add_argument("--n_buckets", type=int, default=8,  help="分层采样桶数")
     parser.add_argument("--source", choices=['all', 'ego', 'nbr'], default='all')
+    parser.add_argument("--reference_mode", choices=['gt', 'rolling'], default='gt')
+    parser.add_argument("--rolling_vocab", default=None)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    rolling_vocab = None
+    if args.reference_mode == 'rolling':
+        if args.rolling_vocab is None:
+            raise ValueError("--reference_mode rolling requires --rolling_vocab")
+        rolling_vocab = MotionVocabulary.load(args.rolling_vocab)
 
     segments = collect_segments(
         args.npz_dir, args.max_files,
@@ -578,6 +668,8 @@ if __name__ == "__main__":
         stratify             = args.stratify,
         n_buckets            = args.n_buckets,
         source               = args.source,
+        reference_mode       = args.reference_mode,
+        rolling_vocab        = rolling_vocab,
     )
 
     vocab = MotionVocabulary(

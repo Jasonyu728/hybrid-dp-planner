@@ -10,3 +10,21 @@ image*
 exp/
 cache/
 checkpoints/
+
+# Local datasets / generated artifacts
+npz_dataset/
+npz2token_dataset/
+yzy_output/
+backup/
+work_md/
+vocab_old/
+
+# Model and nuPlan outputs
+*.pth
+*.ckpt
+*.parquet
+*.tfevents*
+events.out.tfevents*
+
+# Local IDE / agent state
+.claude/settings.local.json

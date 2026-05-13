@@ -1,5 +1,6 @@
 
 import warnings
+import os
 import torch
 import numpy as np
 from typing import Deque, Dict, List, Type
@@ -23,6 +24,10 @@ from diffusion_planner.utils.config import Config
 
 def identity(ego_state, predictions):
     return predictions
+
+
+def _wrap_angle_np(angle: np.ndarray) -> np.ndarray:
+    return (angle + np.pi) % (2 * np.pi) - np.pi
 
 
 class DiffusionPlanner(AbstractPlanner):
@@ -59,6 +64,12 @@ class DiffusionPlanner(AbstractPlanner):
         self.data_processor = DataProcessor(config)
         
         self.observation_normalizer = config.observation_normalizer
+        self._trajectory_debug_log_path = getattr(config, "trajectory_debug_log_path", None)
+        self._trajectory_debug_step = 0
+        self._trajectory_output_mode = getattr(config, "trajectory_output_mode", "token")
+        self._use_continuous_head = getattr(config, "use_continuous_head", False)
+        self._token_selection_mode = getattr(config, "token_selection_mode", "nearest")
+        self._use_token_classifier = getattr(config, "use_token_classifier", False)
 
     def name(self) -> str:
         """
@@ -80,16 +91,28 @@ class DiffusionPlanner(AbstractPlanner):
         self._route_roadblock_ids = initialization.route_roadblock_ids
 
         if self._ckpt_path is not None:
-            state_dict:Dict = torch.load(self._ckpt_path, map_location=self._device)
+            ckpt: Dict = torch.load(self._ckpt_path, map_location=self._device)
+            ckpt_epoch = ckpt.get("epoch", "unknown") if isinstance(ckpt, dict) else "unknown"
+            state_dict = ckpt
             
             if self._ema_enabled:
                 state_dict = state_dict['ema_state_dict']
             else:
                 if "model" in state_dict.keys():
                     state_dict = state_dict['model']
-            # use for ddp
+            # Strip DDP "module." prefix when present; fall back to raw keys if not.
             model_state_dict = {k[len("module."):]: v for k, v in state_dict.items() if k.startswith("module.")}
+            if not model_state_dict:
+                model_state_dict = state_dict
             self._planner.load_state_dict(model_state_dict)
+            print(
+                "[DiffusionPlanner] "
+                f"ckpt={self._ckpt_path}, epoch={ckpt_epoch}, ema={self._ema_enabled}, "
+                f"trajectory_output_mode={self._trajectory_output_mode}, "
+                f"use_continuous_head={self._use_continuous_head}, "
+                f"token_selection_mode={self._token_selection_mode}, "
+                f"use_token_classifier={self._use_token_classifier}"
+            )
         else:
             print("load random model")
         
@@ -104,28 +127,108 @@ class DiffusionPlanner(AbstractPlanner):
 
         return model_inputs
 
-    def outputs_to_trajectory(self, outputs: Dict[str, torch.Tensor], ego_state_history: Deque[EgoState]) -> List[InterpolatableState]:    
+    def outputs_to_trajectory(self, outputs: Dict[str, torch.Tensor], ego_state_history: Deque[EgoState]) -> List[InterpolatableState]:
 
-        predictions = outputs['prediction'][0, 0].detach().cpu().numpy().astype(np.float64) # T, 4
-        heading = np.arctan2(predictions[:, 3], predictions[:, 2])[..., None]
-        predictions = np.concatenate([predictions[..., :2], heading], axis=-1) 
+        raw_predictions = outputs['prediction'][0, 0].detach().cpu().numpy().astype(np.float64) # T, 4
+        heading = np.arctan2(raw_predictions[:, 3], raw_predictions[:, 2])[..., None]
+        predictions = np.concatenate([raw_predictions[..., :2], heading], axis=-1)
+        predictions, safety_applied, safety_reason = self._sanitize_prediction_xyh(predictions)
+        self._log_trajectory_debug(raw_predictions, predictions, safety_applied, safety_reason)
 
         states = transform_predictions_to_states(predictions, ego_state_history, self._future_horizon, self._step_interval)
 
         return states
-    
+
+    def _sanitize_prediction_xyh(self, predictions: np.ndarray):
+        """
+        极简 sanitization：只在模型输出真的会让 nuplan 下游 SVD 崩时介入。
+        其它情况完全 pass-through，零静默修改。
+        """
+        predictions = predictions.astype(np.float64, copy=True)
+        safety_reasons = []
+
+        if not np.isfinite(predictions).all():
+            # SVD-killer: NaN/Inf。直接 nan_to_num 即可（无穷大替成 0），下游不会再崩。
+            safety_reasons.append("nonfinite")
+            predictions = np.nan_to_num(predictions, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return predictions, bool(safety_reasons), "|".join(safety_reasons)
+
+    def _log_trajectory_debug(
+        self,
+        raw_predictions: np.ndarray,
+        predictions: np.ndarray,
+        safety_applied: bool = False,
+        safety_reason: str = "",
+    ) -> None:
+        if not self._trajectory_debug_log_path:
+            return
+
+        log_dir = os.path.dirname(self._trajectory_debug_log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
+        xy = predictions[:, :2]
+        anchors = np.concatenate([np.zeros((1, 2), dtype=np.float64), xy], axis=0)
+        step = np.linalg.norm(np.diff(anchors, axis=0), axis=1)
+        heading = predictions[:, 2]
+        heading_jump = np.abs(np.diff(np.unwrap(heading))) if len(heading) > 1 else np.array([0.0])
+        cos_sin_norm = np.linalg.norm(raw_predictions[:, 2:4], axis=1)
+
+        values = {
+            "step": self._trajectory_debug_step,
+            "safety_applied": int(safety_applied),
+            "safety_reason": safety_reason,
+            "finite_raw": int(np.isfinite(raw_predictions).all()),
+            "finite_xyh": int(np.isfinite(predictions).all()),
+            "end_x": float(xy[-1, 0]),
+            "end_y": float(xy[-1, 1]),
+            "min_x": float(np.nanmin(xy[:, 0])),
+            "max_x": float(np.nanmax(xy[:, 0])),
+            "min_y": float(np.nanmin(xy[:, 1])),
+            "max_y": float(np.nanmax(xy[:, 1])),
+            "step_min": float(np.nanmin(step)),
+            "step_max": float(np.nanmax(step)),
+            "step_mean": float(np.nanmean(step)),
+            "zero_step_ratio": float(np.mean(step < 1e-4)),
+            "heading_jump_max": float(np.nanmax(heading_jump)),
+            "cossin_norm_min": float(np.nanmin(cos_sin_norm)),
+            "cossin_norm_max": float(np.nanmax(cos_sin_norm)),
+        }
+
+        write_header = not os.path.exists(self._trajectory_debug_log_path)
+        with open(self._trajectory_debug_log_path, "a", encoding="utf-8") as f:
+            if write_header:
+                f.write(",".join(values.keys()) + "\n")
+            f.write(",".join(str(v) for v in values.values()) + "\n")
+
+        self._trajectory_debug_step += 1
+
+    def __getstate__(self):
+        # _map_api contains a database connection (not picklable); exclude it so
+        # SimulationLogCallback can serialize this planner via pickle.
+        state = self.__dict__.copy()
+        state.pop('_map_api', None)
+        state.pop('_initialization', None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._map_api = None
+        self._initialization = None
+
     def compute_planner_trajectory(self, current_input: PlannerInput) -> AbstractTrajectory:
         """
         Inherited.
         """
         inputs = self.planner_input_to_model_inputs(current_input)
 
-        inputs = self.observation_normalizer(inputs)        
-        _, outputs = self._planner(inputs)
+        inputs = self.observation_normalizer(inputs)
+        with torch.inference_mode():
+            _, outputs = self._planner(inputs)
 
         trajectory = InterpolatedTrajectory(
             trajectory=self.outputs_to_trajectory(outputs, current_input.history.ego_states)
         )
 
         return trajectory
-    

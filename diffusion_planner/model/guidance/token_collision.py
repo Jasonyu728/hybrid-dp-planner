@@ -7,7 +7,7 @@ Gradient path: energy → SAT distances → ego_corners → ego_traj4
 """
 import torch
 
-from diffusion_planner.utils.diff_decode import _differentiable_decode
+from diffusion_planner.utils.diff_decode import _differentiable_decode, smooth_trajectory_xyh
 from diffusion_planner.model.guidance.collision import (
     batch_signed_distance_rect,
     center_rect_to_points,
@@ -46,6 +46,7 @@ def token_collision_guidance_fn(x, t, cond, inputs, **kwargs):
     # ── Decode ego trajectory (differentiable) ──────────────────────────────
     x_ego    = x[:, 0].reshape(B, K_TOKENS, D)
     traj_ego = _differentiable_decode(x_ego, ego_emb_w, ego_centroids)  # (B, 80, 3)
+    traj_ego = smooth_trajectory_xyh(traj_ego)
 
     ego_h   = traj_ego[:, :, 2]
     ego_cos = torch.cos(ego_h)
@@ -61,6 +62,9 @@ def token_collision_guidance_fn(x, t, cond, inputs, **kwargs):
         traj_nbr = _differentiable_decode(
             x_nbr, nbr_emb_w, nbr_centroids
         ).reshape(B, P_nbr, 80, 3)                                       # (B, P_nbr, T, 3)
+        traj_nbr = smooth_trajectory_xyh(traj_nbr.reshape(B * P_nbr, 80, 3)).reshape(
+            B, P_nbr, 80, 3
+        )
         nbr_h   = traj_nbr[:, :, :, 2]
         nbr_cos = torch.cos(nbr_h)
         nbr_sin = torch.sin(nbr_h)

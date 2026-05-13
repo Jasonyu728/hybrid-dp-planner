@@ -11,6 +11,11 @@ diffusion_planner:
     guidance_fn:
       _target_: diffusion_planner.model.guidance.guidance_wrapper.GuidanceWrapper
       _convert_: "all"
+    ego_progress_rerank_topk: 1
+    ego_progress_rerank_beta: 0.0
+    token_debug_log_path: null
+    token_decode_mode: hard
+    token_decode_temperature: 1.0
 
   ckpt_path: ???
 

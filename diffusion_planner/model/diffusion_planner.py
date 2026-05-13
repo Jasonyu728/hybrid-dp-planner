@@ -67,8 +67,21 @@ class Diffusion_Planner_Decoder(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self):
+        # token_emb / classifier 在 Decoder.__init__ 里已用 centroid 投影 + tied weights
+        # 做了 informed 初始化；通用 _basic_init 会把它们重置成 N(0, 0.02) / xavier，
+        # 必须跳过。注意：不能仅靠 requires_grad 判断，因为 learnable_token_emb=True 时
+        # token_emb 也是 trainable。
+        dec = self.decoder
+        skip_ids = {id(dec.ego_token_emb), id(dec.nbr_token_emb)}
+        if dec.ego_token_classifier is not None:
+            skip_ids.add(id(dec.ego_token_classifier))
+        if dec.nbr_token_classifier is not None:
+            skip_ids.add(id(dec.nbr_token_classifier))
+
         # Initialize transformer layers:
         def _basic_init(m):
+            if id(m) in skip_ids:
+                return
             if isinstance(m, nn.Linear):
                 torch.nn.init.xavier_uniform_(m.weight)
                 if isinstance(m, nn.Linear) and m.bias is not None:
@@ -76,7 +89,7 @@ class Diffusion_Planner_Decoder(nn.Module):
             elif isinstance(m, nn.LayerNorm):
                 nn.init.constant_(m.bias, 0)
                 nn.init.constant_(m.weight, 1.0)
-            elif isinstance(m, nn.Embedding):
+            elif isinstance(m, nn.Embedding) and m.weight.requires_grad:
                 nn.init.normal_(m.weight, mean=0.0, std=0.02)
         self.apply(_basic_init)
 

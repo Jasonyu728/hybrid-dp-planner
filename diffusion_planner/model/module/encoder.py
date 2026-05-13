@@ -141,10 +141,10 @@ class AgentFusionEncoder(nn.Module):
 
         x_result = torch.zeros((B * P, x.shape[-1]), device=x.device)
         x_result[valid_indices] = x  # Fill in valid parts
-        
+
         return x_result.view(B, P, -1) , mask_p.reshape(B, -1), pos.view(B, P, -1)
 
-    
+
 class StaticFusionEncoder(nn.Module):
     def __init__(self, dim, drop_path_rate=0.3, hidden_dim=192, device='cuda'):
         super().__init__()
@@ -262,7 +262,7 @@ class LaneFusionEncoder(nn.Module):
 
         x_result = torch.zeros((B * P, x.shape[-1]), device=x.device)
         x_result[valid_indices] = x  # Fill in valid parts
-        
+
         return x_result.view(B, P, -1) , mask_p.reshape(B, -1), pos.view(B, P, -1)
 
 

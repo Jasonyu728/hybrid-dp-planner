@@ -58,6 +58,13 @@ def save_model(model, optimizer, scheduler, save_path, epoch, train_loss, wandb_
         fileio.put(f.getvalue(), f'{save_path}/model_epoch_{epoch+1}_trainloss_{train_loss:.4f}.pth')
         fileio.put(f.getvalue(), f"{save_path}/latest.pth")
 
+
+def _strip_module_prefix(state_dict):
+    return {
+        k[len("module."):] if k.startswith("module.") else k: v
+        for k, v in state_dict.items()
+    }
+
 def resume_model(path: str, model, optimizer, scheduler, ema, device):
     """
     load ckpt from path
@@ -103,7 +110,11 @@ def resume_model(path: str, model, optimizer, scheduler, ema, device):
         wandb_id = None
 
     try:
-        ema.ema.load_state_dict(ckpt['ema_state_dict'])
+        ema_state_dict = ckpt['ema_state_dict']
+        try:
+            ema.ema.load_state_dict(ema_state_dict)
+        except RuntimeError:
+            ema.ema.load_state_dict(_strip_module_prefix(ema_state_dict))
         ema.ema.eval()
         for p in ema.ema.parameters():
             p.requires_grad_(False)
@@ -113,5 +124,4 @@ def resume_model(path: str, model, optimizer, scheduler, ema, device):
         print('no ema shadow found')
 
     return model, optimizer, scheduler, init_epoch, wandb_id, ema
-
 

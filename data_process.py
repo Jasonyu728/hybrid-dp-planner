@@ -59,11 +59,19 @@ if __name__ == "__main__":
     sensor_root = None
     db_files = None
 
-    # Only preprocess the training data
-    with open('./nuplan_train.json', "r", encoding="utf-8") as file:
-        log_names = json.load(file)
+    # Auto-discover log names from data_path (works for both mini and trainval)
+    import glob as _glob
+    db_paths = _glob.glob(os.path.join(args.data_path, '**', '*.db'), recursive=True)
+    if db_paths:
+        log_names = [os.path.splitext(os.path.basename(p))[0] for p in db_paths]
+        print(f"Found {len(log_names)} log files in {args.data_path}")
+    else:
+        # fallback: use nuplan_train.json if exists
+        with open('./nuplan_train.json', "r", encoding="utf-8") as file:
+            log_names = json.load(file)
+        print(f"Using nuplan_train.json: {len(log_names)} log names")
 
-    map_version = "nuplan-maps-v1.0"    
+    map_version = "nuplan-maps-v1.0"
     builder = NuPlanScenarioBuilder(args.data_path, args.map_path, sensor_root, db_files, map_version)
     scenario_filter = ScenarioFilter(*get_filter_parameters(args.scenarios_per_type, args.total_scenarios, args.shuffle_scenarios, log_names=log_names))
 

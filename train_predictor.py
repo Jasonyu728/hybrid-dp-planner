@@ -81,6 +81,13 @@ def get_args():
     parser.add_argument('--decoder_drop_path_rate', type=float, help='decoder drop out rate', default=0.1)
 
     parser.add_argument('--alpha_planning_loss', type=float, help='coefficient of planning loss (default: 1.0)', default=1.0)
+    parser.add_argument('--lambda_token_cls_ce', type=float, help='coefficient of token classifier CE loss (default: 0.0)', default=0.0)
+    parser.add_argument('--lambda_continuous_traj', type=float, help='coefficient of continuous trajectory head loss (default: 0.0)', default=0.0)
+    parser.add_argument('--lambda_emb_commit', type=float,
+                        help='coefficient of VQ-VAE commitment loss for token embedding. '
+                             'Only effective when --learnable_token_emb True. '
+                             'Standard VQ-VAE uses 0.25. Default 0.0 (embedding frozen).',
+                        default=0.0)
 
     parser.add_argument('--device', type=str, help='run on which device (default: cuda)', default='cuda')
 
@@ -93,6 +100,12 @@ def get_args():
     parser.add_argument('--hidden_dim', type=int, help='hidden dimension', default=192)
     parser.add_argument('--diffusion_model_type', type=str, help='type of diffusion model [x_start, score]', choices=['score', 'x_start'], default='x_start')
     parser.add_argument('--token_emb_dim', type=int, help='dimension of each token embedding vector (default: 64)', default=64)
+    parser.add_argument('--learnable_token_emb', default=False, type=boolean)
+    parser.add_argument('--use_token_classifier', default=False, type=boolean)
+    parser.add_argument('--token_selection_mode', type=str, choices=['nearest', 'classifier'], default='nearest')
+    parser.add_argument('--use_continuous_head', default=False, type=boolean)
+    parser.add_argument('--trajectory_output_mode', type=str, choices=['token', 'continuous_head'], default='token')
+    parser.add_argument('--continuous_head_hidden_dim', type=int, default=512)
 
     # decoder
     parser.add_argument('--predicted_neighbor_num', type=int, help='number of neighbor agents to predict', default=10)
@@ -153,9 +166,15 @@ def model_training(args):
     
     # set up data loaders
     aug = StatePerturbation(augment_prob=args.augment_prob, device=args.device) if args.use_data_augment else None
-    train_set = DiffusionPlannerData(args.train_set, args.train_set_list, args.agent_num, args.predicted_neighbor_num, args.future_len)
+    train_set = DiffusionPlannerData(
+        args.train_set,
+        args.train_set_list,
+        args.agent_num,
+        args.predicted_neighbor_num,
+        args.future_len,
+    )
     train_sampler = DistributedSampler(train_set, num_replicas=ddp.get_world_size(), rank=global_rank, shuffle=True)
-    train_loader = DataLoader(train_set, sampler=train_sampler, batch_size=batch_size//ddp.get_world_size(), num_workers=args.num_workers, pin_memory=args.pin_mem, drop_last=True)
+    train_loader = DataLoader(train_set, sampler=train_sampler, batch_size=batch_size//ddp.get_world_size(), num_workers=args.num_workers, pin_memory=args.pin_mem, drop_last=True, persistent_workers=True, prefetch_factor=4)
    
     if global_rank == 0:
         print("Dataset Prepared: {} train data\n".format(len(train_set)))
@@ -171,18 +190,19 @@ def model_training(args):
         diffusion_planner = DDP(diffusion_planner, device_ids=[rank], find_unused_parameters=False)
         diffusion_planner._set_static_graph()
 
+    raw_model = ddp.get_model(diffusion_planner, args.ddp)
     if args.use_ema:
         model_ema = ModelEma(
-            diffusion_planner,
+            raw_model,
             decay=0.999,
             device=args.device,
         )
     
     if global_rank == 0:
-        print("Model Params: {}".format(sum(p.numel() for p in ddp.get_model(diffusion_planner, args.ddp).parameters())))
+        print("Model Params: {}".format(sum(p.numel() for p in raw_model.parameters())))
 
     # optimizer
-    params = [{'params': ddp.get_model(diffusion_planner, args.ddp).parameters(), 'lr': args.learning_rate}]
+    params = [{'params': raw_model.parameters(), 'lr': args.learning_rate}]
 
     optimizer = optim.AdamW(params)
     scheduler = CosineAnnealingWarmUpRestarts(optimizer, train_epochs, args.warm_up_epoch)
@@ -202,6 +222,7 @@ def model_training(args):
 
     # begin training
     for epoch in range(init_epoch, train_epochs):
+        train_sampler.set_epoch(epoch)
         if global_rank == 0:
             print(f"Epoch {epoch+1}/{train_epochs}")
         train_loss, train_total_loss = train_epoch(train_loader, diffusion_planner, optimizer, args, model_ema, aug)
@@ -219,7 +240,6 @@ def model_training(args):
                 print(f"Model saved in {save_path}\n")
 
         scheduler.step()
-        train_sampler.set_epoch(epoch + 1)
 
 if __name__ == "__main__":
 

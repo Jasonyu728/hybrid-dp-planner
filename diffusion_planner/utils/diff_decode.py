@@ -2,6 +2,45 @@
 Differentiable token → trajectory decoder shared between training and guidance.
 """
 import torch
+import torch.nn.functional as F
+
+
+def smooth_trajectory_xyh(
+    traj_xyh: torch.Tensor,
+    kernel_size: int = 5,
+    sigma: float = 2.0,
+) -> torch.Tensor:
+    """
+    Apply the same Gaussian smoothing used by inference-time token decoding.
+    """
+    if traj_xyh.numel() == 0:
+        return traj_xyh
+
+    n_batch, t_horizon, _ = traj_xyh.shape
+    device = traj_xyh.device
+    dtype = traj_xyh.dtype
+
+    k = torch.arange(kernel_size, device=device, dtype=dtype) - kernel_size // 2
+    kernel = torch.exp(-k ** 2 / (2.0 * sigma ** 2))
+    kernel = (kernel / kernel.sum()).view(1, 1, kernel_size)
+    pad = kernel_size // 2
+
+    xy = traj_xyh[:, :, :2].permute(0, 2, 1)
+    xy = F.pad(xy, (pad, pad), mode="reflect")
+    xy = F.conv1d(xy.reshape(n_batch * 2, 1, -1), kernel)
+    xy = xy.reshape(n_batch, 2, t_horizon).permute(0, 2, 1)
+
+    heading = traj_xyh[:, :, 2]
+    sin_cos = torch.stack([torch.sin(heading), torch.cos(heading)], dim=1)
+    sin_cos = F.pad(sin_cos, (pad, pad), mode="reflect")
+    sin_cos = F.conv1d(sin_cos.reshape(n_batch * 2, 1, -1), kernel)
+    sin_cos = sin_cos.reshape(n_batch, 2, t_horizon)
+    heading = torch.atan2(sin_cos[:, 0], sin_cos[:, 1])
+
+    result = traj_xyh.clone()
+    result[:, :, :2] = xy
+    result[:, :, 2] = heading
+    return result
 
 
 def _differentiable_decode(
